@@ -189,67 +189,77 @@ public class SimpleLlmServer {
             }
         }
 
-        String responseJson;
         if (foundModel == null) {
             addLog("Error: No active model");
-            responseJson = gson.toJson(new ChatResponse("", "No active model loaded. Please load a model in the UI first."));
-        } else {
-            String reply = runInferenceBlocking(request.prompt, foundModel);
-            addLog("Reply generated (" + (reply != null ? reply.length() : 0) + " chars)");
-            responseJson = gson.toJson(new ChatResponse(reply != null ? reply : "", null));
+            sendResponse(out, 400, "Bad Request", "application/json",
+                    "{\"error\":\"No active model loaded\"}");
+            return;
         }
 
-        sendResponse(out, 200, "OK", "application/json", responseJson);
-    }
+        try {
+            StringBuilder sb = new StringBuilder();
+            sb.append("HTTP/1.1 200 OK\r\n");
+            sb.append("Access-Control-Allow-Origin: *\r\n");
+            sb.append("Content-Type: text/event-stream; charset=utf-8\r\n");
+            sb.append("Cache-Control: no-cache\r\n");
+            sb.append("Connection: keep-alive\r\n");
+            sb.append("\r\n");
+            out.write(sb.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            out.flush();
 
-    // ── Inference (blocking) ──────────────────────────────────────────────────
+            final boolean[] done = {false};
 
-    private static String runInferenceBlocking(String prompt, Model model) {
-        final StringBuilder result = new StringBuilder();
-        final boolean[] done = {false};
-        final String[] errorMsg = {null};
-
-        LlmChatModelHelper.INSTANCE.runInference(
-            model,
-            prompt,
-            /* resultListener */ (partial, isDone, thinkingResult) -> {
-                if (partial != null && !((String) partial).startsWith("<ctrl")) {
-                    result.append((String) partial);
-                }
-                if ((Boolean) isDone) {
+            LlmChatModelHelper.INSTANCE.runInference(
+                foundModel,
+                request.prompt,
+                /* resultListener */ (partial, isDone, thinkingResult) -> {
+                    try {
+                        if (partial != null && !((String) partial).startsWith("<ctrl")) {
+                            String chunk = (String) partial;
+                            String json = gson.toJson(new ChatResponse(chunk, null));
+                            out.write(("data: " + json + "\n\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                            out.flush();
+                        }
+                        if ((Boolean) isDone) {
+                            synchronized (done) {
+                                done[0] = true;
+                                done.notifyAll();
+                            }
+                        }
+                    } catch (Exception e) {}
+                    return Unit.INSTANCE;
+                },
+                /* cleanUpListener */ () -> Unit.INSTANCE,
+                /* onError */ (err) -> {
+                    try {
+                        String json = gson.toJson(new ChatResponse("", "Error: " + err));
+                        out.write(("data: " + json + "\n\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                        out.flush();
+                    } catch (Exception e) {}
                     synchronized (done) {
                         done[0] = true;
                         done.notifyAll();
                     }
-                }
-                return Unit.INSTANCE;
-            },
-            /* cleanUpListener */ () -> Unit.INSTANCE,
-            /* onError */ (err) -> {
-                errorMsg[0] = (String) err;
-                synchronized (done) {
-                    done[0] = true;
-                    done.notifyAll();
-                }
-                return Unit.INSTANCE;
-            },
-            /* images */ Collections.emptyList(),
-            /* audioClips */ Collections.emptyList(),
-            /* coroutineScope */ null,
-            /* extraContext */ null
-        );
+                    return Unit.INSTANCE;
+                },
+                /* images */ java.util.Collections.emptyList(),
+                /* audioClips */ java.util.Collections.emptyList(),
+                /* coroutineScope */ null,
+                /* extraContext */ null
+            );
 
-        synchronized (done) {
-            long deadline = System.currentTimeMillis() + 60_000; // 60s timeout
-            while (!done[0]) {
-                long remaining = deadline - System.currentTimeMillis();
-                if (remaining <= 0) break;
-                try { done.wait(remaining); } catch (InterruptedException e) { break; }
+            synchronized (done) {
+                long deadline = System.currentTimeMillis() + 60_000;
+                while (!done[0]) {
+                    long remaining = deadline - System.currentTimeMillis();
+                    if (remaining <= 0) break;
+                    try { done.wait(remaining); } catch (InterruptedException e) { break; }
+                }
             }
+            addLog("Stream finished");
+        } catch (Exception e) {
+            addLog("Stream error: " + e.getMessage());
         }
-
-        if (errorMsg[0] != null) return "Error: " + errorMsg[0];
-        return result.toString();
     }
 
     // ── HTTP helpers ──────────────────────────────────────────────────────────
