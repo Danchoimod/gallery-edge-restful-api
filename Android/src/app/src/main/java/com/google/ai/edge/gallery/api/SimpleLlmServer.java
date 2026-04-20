@@ -78,12 +78,24 @@ public class SimpleLlmServer {
 
     private static void handleClient(Socket socket) {
         try (socket) {
-            BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-            PrintWriter writer = new PrintWriter(socket.getOutputStream());
+            java.io.InputStream in = socket.getInputStream();
+            java.io.OutputStream out = socket.getOutputStream();
 
-            // Read request line
-            String requestLine = reader.readLine();
-            if (requestLine == null) return;
+            // Read headers byte by byte
+            StringBuilder headerBuilder = new StringBuilder();
+            int b;
+            while ((b = in.read()) != -1) {
+                headerBuilder.append((char) b);
+                if (headerBuilder.toString().endsWith("\r\n\r\n")) {
+                    break;
+                }
+            }
+
+            String fullHeaders = headerBuilder.toString();
+            if (fullHeaders.isEmpty()) return;
+
+            String[] lines = fullHeaders.split("\r\n");
+            String requestLine = lines[0];
             addLog("← " + requestLine);
 
             String[] parts = requestLine.split(" ");
@@ -92,9 +104,8 @@ public class SimpleLlmServer {
 
             // Read headers
             int contentLength = 0;
-            String header;
-            while ((header = reader.readLine()) != null && !header.isEmpty()) {
-                if (header.toLowerCase().startsWith("content-length:")) {
+            for (String header : lines) {
+                if (header.toLowerCase(Locale.US).startsWith("content-length:")) {
                     try { contentLength = Integer.parseInt(header.substring(15).trim()); }
                     catch (NumberFormatException ignored) {}
                 }
@@ -102,24 +113,30 @@ public class SimpleLlmServer {
 
             // ── CORS pre-flight ────────────────────────────────────────────────
             if ("OPTIONS".equalsIgnoreCase(method)) {
-                sendResponse(writer, 204, "No Content", "", "");
+                sendResponse(out, 204, "No Content", "", "");
                 return;
             }
 
             // ── Route ─────────────────────────────────────────────────────────
             if ("GET".equalsIgnoreCase(method) && path.equals("/health")) {
-                handleHealth(writer);
+                handleHealth(out);
 
             } else if ("GET".equalsIgnoreCase(method) && path.equals("/models")) {
-                handleModels(writer);
+                handleModels(out);
 
             } else if ("POST".equalsIgnoreCase(method) && path.equals("/chat")) {
-                char[] body = new char[contentLength];
-                reader.read(body, 0, contentLength);
-                handleChat(writer, new String(body));
+                byte[] bodyBytes = new byte[contentLength];
+                int read = 0;
+                while (read < contentLength) {
+                    int r = in.read(bodyBytes, read, contentLength - read);
+                    if (r == -1) break;
+                    read += r;
+                }
+                String rawBody = new String(bodyBytes, java.nio.charset.StandardCharsets.UTF_8);
+                handleChat(out, rawBody);
 
             } else {
-                sendResponse(writer, 404, "Not Found",
+                sendResponse(out, 404, "Not Found",
                         "application/json",
                         "{\"error\":\"Not found: " + method + " " + path + "\"}");
             }
@@ -131,32 +148,32 @@ public class SimpleLlmServer {
 
     // ── Endpoint handlers ─────────────────────────────────────────────────────
 
-    private static void handleHealth(PrintWriter writer) {
+    private static void handleHealth(java.io.OutputStream out) {
         String body = gson.toJson(new HealthResponse(true));
-        sendResponse(writer, 200, "OK", "application/json", body);
+        sendResponse(out, 200, "OK", "application/json", body);
     }
 
-    private static void handleModels(PrintWriter writer) {
+    private static void handleModels(java.io.OutputStream out) {
         List<String> names = new ArrayList<>();
         for (Model m : ModelRegistry.models) {
             names.add(m.getName());
         }
         String body = "{\"models\":" + gson.toJson(names) + "}";
-        sendResponse(writer, 200, "OK", "application/json", body);
+        sendResponse(out, 200, "OK", "application/json", body);
     }
 
-    private static void handleChat(PrintWriter writer, String rawBody) {
+    private static void handleChat(java.io.OutputStream out, String rawBody) {
         ChatRequest request;
         try {
             request = gson.fromJson(rawBody, ChatRequest.class);
         } catch (Exception e) {
-            sendResponse(writer, 400, "Bad Request", "application/json",
+            sendResponse(out, 400, "Bad Request", "application/json",
                     "{\"error\":\"Invalid JSON body\"}");
             return;
         }
 
         if (request == null || request.prompt == null || request.prompt.isEmpty()) {
-            sendResponse(writer, 400, "Bad Request", "application/json",
+            sendResponse(out, 400, "Bad Request", "application/json",
                     "{\"error\":\"Missing 'prompt' field\"}");
             return;
         }
@@ -182,7 +199,7 @@ public class SimpleLlmServer {
             responseJson = gson.toJson(new ChatResponse(reply != null ? reply : "", null));
         }
 
-        sendResponse(writer, 200, "OK", "application/json", responseJson);
+        sendResponse(out, 200, "OK", "application/json", responseJson);
     }
 
     // ── Inference (blocking) ──────────────────────────────────────────────────
@@ -237,22 +254,29 @@ public class SimpleLlmServer {
 
     // ── HTTP helpers ──────────────────────────────────────────────────────────
 
-    private static void sendResponse(PrintWriter writer, int code, String reason,
-                                     String contentType, String body) {
-        byte[] bodyBytes = body.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        writer.print("HTTP/1.1 " + code + " " + reason + "\r\n");
-        writer.print("Access-Control-Allow-Origin: *\r\n");
-        writer.print("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
-        writer.print("Access-Control-Allow-Headers: Content-Type\r\n");
-        if (!contentType.isEmpty()) {
-            writer.print("Content-Type: " + contentType + "; charset=utf-8\r\n");
+    private static void sendResponse(java.io.OutputStream out, int code, String reason,
+                                     String contentType, String bodyStr) {
+        try {
+            byte[] bodyBytes = bodyStr.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            StringBuilder sb = new StringBuilder();
+            sb.append("HTTP/1.1 ").append(code).append(" ").append(reason).append("\r\n");
+            sb.append("Access-Control-Allow-Origin: *\r\n");
+            sb.append("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
+            sb.append("Access-Control-Allow-Headers: Content-Type\r\n");
+            if (!contentType.isEmpty()) {
+                sb.append("Content-Type: ").append(contentType).append("; charset=utf-8\r\n");
+            }
+            sb.append("Content-Length: ").append(bodyBytes.length).append("\r\n");
+            sb.append("Connection: close\r\n");
+            sb.append("\r\n");
+            
+            out.write(sb.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            out.write(bodyBytes);
+            out.flush();
+            addLog("→ " + code + " " + reason + (bodyStr.length() > 80 ? " [" + bodyBytes.length + " bytes]" : " " + bodyStr));
+        } catch (Exception e) {
+            addLog("Error sending response: " + e.getMessage());
         }
-        writer.print("Content-Length: " + bodyBytes.length + "\r\n");
-        writer.print("Connection: close\r\n");
-        writer.print("\r\n");
-        writer.print(body);
-        writer.flush();
-        addLog("→ " + code + " " + reason + (body.length() > 80 ? " [" + bodyBytes.length + " bytes]" : " " + body));
     }
 
     private static void addLog(String msg) {
