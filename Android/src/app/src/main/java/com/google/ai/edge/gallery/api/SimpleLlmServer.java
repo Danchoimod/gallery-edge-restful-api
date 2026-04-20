@@ -135,6 +135,28 @@ public class SimpleLlmServer {
                 String rawBody = new String(bodyBytes, java.nio.charset.StandardCharsets.UTF_8);
                 handleChat(out, rawBody);
 
+            } else if ("POST".equalsIgnoreCase(method) && path.equals("/stop")) {
+                byte[] bodyBytes = new byte[contentLength];
+                int read = 0;
+                while (read < contentLength) {
+                    int r = in.read(bodyBytes, read, contentLength - read);
+                    if (r == -1) break;
+                    read += r;
+                }
+                String rawBody = new String(bodyBytes, java.nio.charset.StandardCharsets.UTF_8);
+                handleStop(out, rawBody);
+
+            } else if ("POST".equalsIgnoreCase(method) && path.equals("/system")) {
+                byte[] bodyBytes = new byte[contentLength];
+                int read = 0;
+                while (read < contentLength) {
+                    int r = in.read(bodyBytes, read, contentLength - read);
+                    if (r == -1) break;
+                    read += r;
+                }
+                String rawBody = new String(bodyBytes, java.nio.charset.StandardCharsets.UTF_8);
+                handleSystem(out, rawBody);
+
             } else {
                 sendResponse(out, 404, "Not Found",
                         "application/json",
@@ -160,6 +182,56 @@ public class SimpleLlmServer {
         }
         String body = "{\"models\":" + gson.toJson(names) + "}";
         sendResponse(out, 200, "OK", "application/json", body);
+    }
+
+    private static void handleStop(java.io.OutputStream out, String rawBody) {
+        ChatRequest request = null;
+        try { request = gson.fromJson(rawBody, ChatRequest.class); } catch (Exception ignored) {}
+
+        Model foundModel = findModel(request != null ? request.modelName : null);
+        if (foundModel != null) {
+            LlmChatModelHelper.INSTANCE.stopResponse(foundModel);
+            sendResponse(out, 200, "OK", "application/json", "{\"status\":\"stopped\"}");
+        } else {
+            sendResponse(out, 400, "Bad Request", "application/json", "{\"error\":\"No active model\"}");
+        }
+    }
+
+    private static void handleSystem(java.io.OutputStream out, String rawBody) {
+        SystemRequest request;
+        try { request = gson.fromJson(rawBody, SystemRequest.class); } catch (Exception e) {
+            sendResponse(out, 400, "Bad Request", "application/json", "{\"error\":\"Invalid JSON\"}");
+            return;
+        }
+
+        Model foundModel = findModel(request.modelName);
+        if (foundModel != null) {
+            try {
+                com.google.ai.edge.litertlm.Contents instruction = null;
+                if (request.systemPrompt != null && !request.systemPrompt.isEmpty()) {
+                    java.util.List<com.google.ai.edge.litertlm.Content> contentList = new java.util.ArrayList<>();
+                    contentList.add(new com.google.ai.edge.litertlm.Content.Text(request.systemPrompt));
+                    instruction = com.google.ai.edge.litertlm.Contents.Companion.of(contentList);
+                }
+                LlmChatModelHelper.INSTANCE.resetConversation(foundModel, false, false, instruction, java.util.Collections.emptyList(), false);
+                sendResponse(out, 200, "OK", "application/json", "{\"status\":\"system prompt updated\"}");
+            } catch (Exception e) {
+                sendResponse(out, 500, "Error", "application/json", "{\"error\":\"" + e.getMessage() + "\"}");
+            }
+        } else {
+            sendResponse(out, 400, "Bad Request", "application/json", "{\"error\":\"No active model\"}");
+        }
+    }
+
+    private static Model findModel(String modelName) {
+        for (Model m : ModelRegistry.models) {
+            if (modelName != null) {
+                if (modelName.equals(m.getName())) return m;
+            } else if (m.getInstance() != null) {
+                return m;
+            }
+        }
+        return null;
     }
 
     private static void handleChat(java.io.OutputStream out, String rawBody) {
@@ -300,6 +372,11 @@ public class SimpleLlmServer {
 
     public static class ChatRequest {
         public String prompt;
+        public String modelName;
+    }
+
+    public static class SystemRequest {
+        public String systemPrompt;
         public String modelName;
     }
 
