@@ -49,7 +49,12 @@ import androidx.core.animation.doOnEnd
 import androidx.core.net.toUri
 import androidx.core.os.bundleOf
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import com.google.ai.edge.gallery.api.ModelRegistry
+import com.google.ai.edge.gallery.api.SimpleLlmServer
+import com.google.ai.edge.gallery.ui.modelmanager.ModelInitializationStatusType
 import com.google.ai.edge.gallery.ui.modelmanager.ModelManagerViewModel
 import com.google.ai.edge.gallery.ui.theme.GalleryTheme
 import com.google.ai.edge.litertlm.ExperimentalApi
@@ -119,6 +124,26 @@ class MainActivity : ComponentActivity() {
       ExperimentalFlags.enableBenchmark = false
 
       contentSet = true
+    }
+
+    // ── Start local HTTP API server on port 8080 ───────────────────────────
+    SimpleLlmServer.start(SERVER_PORT)
+
+    // Keep ModelRegistry in sync with whatever models are loaded in the ViewModel.
+    // We observe uiState changes and rebuild the registry each time.
+    lifecycleScope.launch {
+      repeatOnLifecycle(Lifecycle.State.STARTED) {
+        modelManagerViewModel.uiState.collect { state ->
+          val initialized = state.modelInitializationStatus
+            .filter { it.value.status == ModelInitializationStatusType.INITIALIZED }
+            .keys
+          val loadedModels = state.tasks
+            .flatMap { it.models }
+            .filter { initialized.contains(it.name) }
+          ModelRegistry.models.clear()
+          ModelRegistry.models.addAll(loadedModels)
+        }
+      }
     }
 
     modelManagerViewModel.loadModelAllowlist()
@@ -214,7 +239,13 @@ class MainActivity : ComponentActivity() {
     )
   }
 
+  override fun onDestroy() {
+    super.onDestroy()
+    SimpleLlmServer.stop()
+  }
+
   companion object {
     private const val TAG = "AGMainActivity"
+    private const val SERVER_PORT = 8080
   }
 }
